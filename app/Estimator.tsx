@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { QWEN35_COLLECTION, qwen35Config } from "./qwen35-presets";
 
 type JsonObject = Record<string, unknown>;
 
@@ -23,6 +24,7 @@ type ModelShape = {
   name: string;
   hidden: number;
   layers: number;
+  layerTypes: string[];
   fullAttentionLayers: number;
   linearAttentionLayers: number;
   heads: number;
@@ -31,6 +33,7 @@ type ModelShape = {
   experts: number;
   topK: number;
   moeIntermediate: number;
+  denseIntermediate: number;
   sharedIntermediate: number;
   vocab: number;
   tied: boolean;
@@ -67,9 +70,14 @@ function textConfigOf(config: JsonObject): JsonObject {
 
 function shapeFromConfig(config: JsonObject): ModelShape {
   const c = textConfigOf(config);
-  const layerTypes = Array.isArray(c.layer_types)
+  const configuredLayerTypes = Array.isArray(c.layer_types)
     ? c.layer_types.map(String)
     : Array(n(c.num_hidden_layers, 1)).fill("full_attention");
+  const layers = n(c.num_hidden_layers, configuredLayerTypes.length);
+  const layerTypes = Array.from(
+    { length: layers },
+    (_, index) => configuredLayerTypes[index] ?? "full_attention",
+  );
   const architecture = Array.isArray(config.architectures)
     ? String(config.architectures[0] ?? "Megatron 模型")
     : String(c.model_type ?? "Megatron 模型");
@@ -77,7 +85,8 @@ function shapeFromConfig(config: JsonObject): ModelShape {
   return {
     name: architecture.replace(/ForConditionalGeneration|ForCausalLM/g, ""),
     hidden: n(c.hidden_size),
-    layers: n(c.num_hidden_layers, layerTypes.length),
+    layers,
+    layerTypes,
     fullAttentionLayers: layerTypes.filter((item) => item === "full_attention").length,
     linearAttentionLayers: layerTypes.filter((item) => item !== "full_attention").length,
     heads: n(c.num_attention_heads),
@@ -86,6 +95,7 @@ function shapeFromConfig(config: JsonObject): ModelShape {
     experts: n(c.num_experts),
     topK: n(c.num_experts_per_tok, 1),
     moeIntermediate: n(c.moe_intermediate_size, n(c.intermediate_size)),
+    denseIntermediate: n(c.intermediate_size, n(c.moe_intermediate_size)),
     sharedIntermediate: n(c.shared_expert_intermediate_size),
     vocab: n(c.vocab_size),
     tied: Boolean(config.tie_word_embeddings ?? c.tie_word_embeddings),
@@ -110,18 +120,19 @@ function calculate(shape: ModelShape, x: Inputs) {
   const linearAttention = linearQK + linearV + linearO + linearGates;
 
   const expertPerLayer = shape.experts * 3 * shape.hidden * shape.moeIntermediate;
+  const denseMlpPerLayer = shape.experts > 0 ? 0 : 3 * shape.hidden * shape.denseIntermediate;
   const sharedPerLayer = 3 * shape.hidden * shape.sharedIntermediate;
   const routerPerLayer = shape.hidden * shape.experts;
-  const moePerLayer = expertPerLayer + sharedPerLayer + routerPerLayer;
   const normPerLayer = shape.hidden * 2;
   const mtpMultiplier = shape.layers > 0 ? 1 + shape.mtpLayers / shape.layers : 1;
 
   const expertParams = expertPerLayer * shape.layers * mtpMultiplier;
-  const denseLayerParams =
-    (shape.fullAttentionLayers * fullAttention +
-      shape.linearAttentionLayers * linearAttention +
-      shape.layers * (sharedPerLayer + routerPerLayer + normPerLayer)) *
-    mtpMultiplier;
+  const fullAttentionParams = shape.fullAttentionLayers * fullAttention * mtpMultiplier;
+  const linearAttentionParams = shape.linearAttentionLayers * linearAttention * mtpMultiplier;
+  const denseMlpParams = denseMlpPerLayer * shape.layers * mtpMultiplier;
+  const denseMoEParams =
+    shape.layers * (sharedPerLayer + routerPerLayer + normPerLayer) * mtpMultiplier;
+  const denseLayerParams = fullAttentionParams + linearAttentionParams + denseMlpParams + denseMoEParams;
   const embedding = shape.vocab * shape.hidden * (shape.tied ? 1 : 2);
   const denseParams = denseLayerParams + embedding;
   const totalParams = denseParams + expertParams;
@@ -133,30 +144,11 @@ function calculate(shape: ModelShape, x: Inputs) {
     shape.linearAttentionLayers * linearAttention +
     shape.layers * (activeExpertPerLayer + routerPerLayer + normPerLayer);
 
-  const topology = x.tp * x.pp * x.cp;
+  const pp = Math.max(Math.floor(x.pp), 1);
+  const topology = x.tp * pp * x.cp;
   const dp = x.totalGpus / Math.max(topology, 1);
   const validTopology = Number.isInteger(dp) && dp >= 1 && Number.isInteger(dp / x.ep);
   const expertDp = Math.max(dp / Math.max(x.ep, 1), 1);
-  const localDense = denseParams / Math.max(x.tp * x.pp, 1);
-  const localExpert = expertParams / Math.max(x.etp * x.ep * x.pp, 1);
-  const localParams = localDense + localExpert;
-
-  // Megatron mixed-precision convention: BF16 weights (2 B), FP32 main grads (4 B),
-  // and 12 B of Adam master weights/moments, sharded across data-parallel ranks.
-  const weightBytes = localParams * 2;
-  const gradientBytes = localParams * 4;
-  const optimizerDistributedBytes =
-    localDense * 12 / Math.max(dp, 1) + localExpert * 12 / expertDp;
-  const optimizerReplicatedBytes = localParams * 12;
-  const optimizerBytes = x.distributedOptimizer
-    ? optimizerDistributedBytes
-    : optimizerReplicatedBytes;
-  const modelWeights = weightBytes / GiB;
-  const gradients = gradientBytes / GiB;
-  const optimizer = optimizerBytes / GiB;
-  const optimizerDistributed = optimizerDistributedBytes / GiB;
-  const optimizerReplicated = optimizerReplicatedBytes / GiB;
-  const modelState = modelWeights + gradients + optimizer;
 
   const tokens = x.microBatch * x.sequenceLength / Math.max(x.cp, 1);
   const hiddenBytes = tokens * shape.hidden * 2;
@@ -165,20 +157,112 @@ function calculate(shape: ModelShape, x: Inputs) {
   const linearLayerActivation =
     hiddenBytes * (3.5 + 9 / Math.max(x.tp, 1)) +
     tokens * linearWidth * 2 / Math.max(x.tp, 1);
-  const moeActivation =
-    tokens * shape.topK * shape.moeIntermediate * 2 / Math.max(x.etp * x.ep, 1);
-  const savedPerModel =
-    shape.fullAttentionLayers * fullLayerActivation +
-    shape.linearAttentionLayers * linearLayerActivation +
-    shape.layers * moeActivation;
-  const pipelineInflight = Math.max(x.pp, 1);
+  const moeActivation = shape.experts > 0
+    ? tokens * shape.topK * shape.moeIntermediate * 2 / Math.max(x.etp * x.ep, 1)
+    : tokens * shape.denseIntermediate * 2 / Math.max(x.tp, 1);
   const recomputeFactor = x.recompute === "full" ? 0.2 : x.recompute === "selective" ? 0.56 : 1;
-  const activationBase = savedPerModel / Math.max(x.pp, 1) * pipelineInflight / GiB;
-  const activationNoRecompute = activationBase;
-  const activationSelective = activationBase * 0.56;
-  const activationFull = activationBase * 0.2;
-  const activation = activationBase * recomputeFactor;
-  const total = modelState + activation + x.overhead;
+  const denseCorePerLayer = denseMlpPerLayer + sharedPerLayer + routerPerLayer + normPerLayer;
+  const averageDenseLayer = shape.layers > 0
+    ? (shape.fullAttentionLayers * fullAttention +
+      shape.linearAttentionLayers * linearAttention +
+      shape.layers * denseCorePerLayer) / shape.layers
+    : 0;
+  const averageActivationLayer = shape.layers > 0
+    ? (shape.fullAttentionLayers * fullLayerActivation +
+      shape.linearAttentionLayers * linearLayerActivation +
+      shape.layers * moeActivation) / shape.layers
+    : 0;
+  const embeddingMatrix = shape.vocab * shape.hidden;
+
+  // Each PP rank owns a contiguous layer range. The last rank also owns MTP layers.
+  const ppRanks = Array.from({ length: pp }, (_, rank) => {
+    const layerStart = Math.floor(rank * shape.layers / pp);
+    const layerEnd = Math.floor((rank + 1) * shape.layers / pp);
+    const rankLayerTypes = shape.layerTypes.slice(layerStart, layerEnd);
+    const fullLayers = rankLayerTypes.filter((type) => type === "full_attention").length;
+    const linearLayers = rankLayerTypes.length - fullLayers;
+    const layerCount = rankLayerTypes.length;
+    const mtpLayers = rank === pp - 1 ? shape.mtpLayers : 0;
+    const roles: string[] = [];
+
+    let denseGlobal =
+      fullLayers * fullAttention +
+      linearLayers * linearAttention +
+      layerCount * denseCorePerLayer +
+      mtpLayers * averageDenseLayer;
+    const expertGlobal = (layerCount + mtpLayers) * expertPerLayer;
+
+    if (rank === 0) {
+      denseGlobal += embeddingMatrix;
+      roles.push("Embedding");
+    }
+    if (rank === pp - 1 && (!shape.tied || pp > 1)) {
+      denseGlobal += embeddingMatrix;
+      roles.push(shape.tied ? "Tied LM Head" : "LM Head");
+    }
+    if (mtpLayers > 0) roles.push(`MTP × ${mtpLayers}`);
+
+    const localDense = denseGlobal / Math.max(x.tp, 1);
+    const localExpert = expertGlobal / Math.max(x.etp * x.ep, 1);
+    const localParams = localDense + localExpert;
+    const modelWeights = localParams * 2 / GiB;
+    const gradients = localParams * 4 / GiB;
+    const optimizerDistributed =
+      (localDense * 12 / Math.max(dp, 1) + localExpert * 12 / expertDp) / GiB;
+    const optimizerReplicated = localParams * 12 / GiB;
+    const optimizer = x.distributedOptimizer ? optimizerDistributed : optimizerReplicated;
+    const modelState = modelWeights + gradients + optimizer;
+    const pipelineInflight = Math.max(pp - rank, 1);
+    const savedActivation =
+      fullLayers * fullLayerActivation +
+      linearLayers * linearLayerActivation +
+      layerCount * moeActivation +
+      mtpLayers * averageActivationLayer;
+    const activationNoRecompute = savedActivation * pipelineInflight / GiB;
+    const activationSelective = activationNoRecompute * 0.56;
+    const activationFull = activationNoRecompute * 0.2;
+    const activation = activationNoRecompute * recomputeFactor;
+
+    return {
+      rank,
+      layerStart,
+      layerEnd,
+      layerCount,
+      fullLayers,
+      linearLayers,
+      mtpLayers,
+      roles,
+      denseGlobal,
+      expertGlobal,
+      localDense,
+      localExpert,
+      localParams,
+      modelWeights,
+      gradients,
+      optimizer,
+      optimizerDistributed,
+      optimizerReplicated,
+      modelState,
+      pipelineInflight,
+      activation,
+      activationNoRecompute,
+      activationSelective,
+      activationFull,
+      total: modelState + activation + x.overhead,
+      totalNoRecompute: modelState + activationNoRecompute + x.overhead,
+      totalSelective: modelState + activationSelective + x.overhead,
+      totalFull: modelState + activationFull + x.overhead,
+      totalDistributed: modelWeights + gradients + optimizerDistributed + activation + x.overhead,
+      totalReplicated: modelWeights + gradients + optimizerReplicated + activation + x.overhead,
+    };
+  });
+
+  const peakRank = ppRanks.reduce((peak, rank) => rank.total > peak.total ? rank : peak);
+  const peakNoRecompute = ppRanks.reduce((peak, rank) => rank.totalNoRecompute > peak.totalNoRecompute ? rank : peak);
+  const peakSelective = ppRanks.reduce((peak, rank) => rank.totalSelective > peak.totalSelective ? rank : peak);
+  const peakFull = ppRanks.reduce((peak, rank) => rank.totalFull > peak.totalFull ? rank : peak);
+  const peakDistributed = ppRanks.reduce((peak, rank) => rank.totalDistributed > peak.totalDistributed ? rank : peak);
+  const peakReplicated = ppRanks.reduce((peak, rank) => rank.totalReplicated > peak.totalReplicated ? rank : peak);
   const capacity = x.gpuMemory;
 
   return {
@@ -186,38 +270,47 @@ function calculate(shape: ModelShape, x: Inputs) {
     activeParams,
     denseParams,
     expertParams,
-    localDense,
-    localExpert,
-    localParams,
-    modelWeights,
-    gradients,
-    optimizer,
-    optimizerDistributed,
-    optimizerReplicated,
-    modelState,
-    activation,
-    activationNoRecompute,
-    activationSelective,
-    activationFull,
+    fullAttentionParams,
+    linearAttentionParams,
+    denseMoEParams,
+    denseMlpParams,
+    embedding,
+    expertPerLayer,
+    mtpMultiplier,
+    localDense: peakRank.localDense,
+    localExpert: peakRank.localExpert,
+    localParams: peakRank.localParams,
+    modelWeights: peakRank.modelWeights,
+    gradients: peakRank.gradients,
+    optimizer: peakRank.optimizer,
+    optimizerDistributed: peakDistributed.optimizerDistributed,
+    optimizerReplicated: peakReplicated.optimizerReplicated,
+    modelState: peakRank.modelState,
+    activation: peakRank.activation,
+    activationNoRecompute: peakNoRecompute.activationNoRecompute,
+    activationSelective: peakSelective.activationSelective,
+    activationFull: peakFull.activationFull,
     recomputeFactor,
     tokens,
     fullLayerActivation,
     linearLayerActivation,
     moeActivation,
-    pipelineInflight,
+    pipelineInflight: peakRank.pipelineInflight,
     overhead: x.overhead,
-    total,
-    totalNoRecompute: modelState + activationNoRecompute + x.overhead,
-    totalSelective: modelState + activationSelective + x.overhead,
-    totalFull: modelState + activationFull + x.overhead,
-    totalDistributed: modelWeights + gradients + optimizerDistributed + activation + x.overhead,
-    totalReplicated: modelWeights + gradients + optimizerReplicated + activation + x.overhead,
+    total: peakRank.total,
+    totalNoRecompute: peakNoRecompute.totalNoRecompute,
+    totalSelective: peakSelective.totalSelective,
+    totalFull: peakFull.totalFull,
+    totalDistributed: peakDistributed.totalDistributed,
+    totalReplicated: peakReplicated.totalReplicated,
     capacity,
-    headroom: capacity - total,
-    usage: total / Math.max(capacity, 1) * 100,
+    headroom: capacity - peakRank.total,
+    usage: peakRank.total / Math.max(capacity, 1) * 100,
     dp,
     expertDp,
     validTopology,
+    ppRanks,
+    peakRank,
   };
 }
 
@@ -262,9 +355,11 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
   const [config, setConfig] = useState<JsonObject>(initialConfig);
   const [configError, setConfigError] = useState("");
   const [showConfig, setShowConfig] = useState(false);
+  const [selectedPresetId, setSelectedPresetId] = useState("Qwen3.5-122B-A10B");
 
   const shape = useMemo(() => shapeFromConfig(config), [config]);
   const result = useMemo(() => calculate(shape, inputs), [shape, inputs]);
+  const selectedPreset = QWEN35_COLLECTION.find((preset) => preset.id === selectedPresetId);
   const update = <K extends keyof Inputs>(key: K, value: Inputs[K]) =>
     setInputs((current) => ({ ...current, [key]: value }));
 
@@ -273,9 +368,20 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
       const parsed = JSON.parse(configText) as JsonObject;
       setConfig(parsed);
       setConfigError("");
+      setSelectedPresetId("");
     } catch (error) {
       setConfigError(error instanceof Error ? error.message : "JSON 格式不正确");
     }
+  };
+
+  const loadPreset = (id: string) => {
+    const preset = QWEN35_COLLECTION.find((item) => item.id === id);
+    if (!preset) return;
+    const nextConfig = qwen35Config(preset);
+    setConfig(nextConfig);
+    setConfigText(JSON.stringify(nextConfig, null, 2));
+    setConfigError("");
+    setSelectedPresetId(id);
   };
 
   const status = !result.validTopology
@@ -307,7 +413,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
           </p>
           <div className="model-badge">
             <span>已载入配置</span>
-            <strong>{shape.name}</strong>
+            <strong>{selectedPreset?.id ?? shape.name}</strong>
             <small>{compact(result.totalParams)}B 总参数 · {compact(result.activeParams)}B 激活参数</small>
           </div>
         </div>
@@ -320,6 +426,44 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
             <div><h2>训练配置</h2><p>调整并行策略与批次设置</p></div>
           </div>
 
+          <div className="control-group preset-collection">
+            <h3>Qwen3.5 Collection</h3>
+            <label className="field full">
+              <span>官方正式模型</span>
+              <span className="input-wrap select-wrap">
+                <select value={selectedPresetId} onChange={(event) => loadPreset(event.target.value)}>
+                  {(["Dense", "MoE"] as const).map((family) => (
+                    <optgroup key={family} label={family}>
+                      {QWEN35_COLLECTION.filter((preset) => preset.family === family).map((preset) => (
+                        <option key={preset.id} value={preset.id}>{preset.id} · {preset.nominalParams}</option>
+                      ))}
+                    </optgroup>
+                  ))}
+                  {!selectedPresetId ? <option value="">自定义 JSON</option> : null}
+                </select>
+              </span>
+            </label>
+            {selectedPreset ? (
+              <div className="preset-summary">
+                <span className={selectedPreset.family === "MoE" ? "moe" : "dense"}>{selectedPreset.family}</span>
+                <strong>标称 {selectedPreset.nominalParams}</strong>
+                <a href={selectedPreset.sourceUrl} target="_blank" rel="noreferrer">Hugging Face 配置</a>
+              </div>
+            ) : null}
+            <p className="preset-note">基于 Qwen 官方 text_config；当前估算不包含视觉编码器。</p>
+          </div>
+
+          <button className="config-toggle" type="button" onClick={() => setShowConfig((value) => !value)} aria-expanded={showConfig}>
+            <span>模型 JSON</span><span>{showConfig ? "收起 −" : "编辑 +"}</span>
+          </button>
+          {showConfig ? (
+            <div className="json-panel">
+              <textarea aria-label="模型 JSON 配置" value={configText} onChange={(e) => setConfigText(e.target.value)} spellCheck={false} />
+              {configError ? <p className="json-error">{configError}</p> : null}
+              <button type="button" onClick={applyConfig}>应用配置</button>
+            </div>
+          ) : null}
+
           <div className="control-group">
             <h3>硬件</h3>
             <div className="field-grid two">
@@ -329,7 +473,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <span className="input-wrap select-wrap">
                   <select value={inputs.gpuMemory} onChange={(e) => update("gpuMemory", Number(e.target.value))}>
                     <option value={80}>80 GB · H100</option>
-                    <option value={96}>96 GB</option>
+                    <option value={96}>96 GB · H20</option>
                     <option value={141}>141 GB · H200</option>
                     <option value={192}>192 GB · B200</option>
                   </select>
@@ -380,28 +524,18 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
             <NumberField label="单卡额外预留" value={inputs.overhead} min={0} suffix="GB" onChange={(v) => update("overhead", v)} />
           </div>
 
-          <button className="config-toggle" type="button" onClick={() => setShowConfig((value) => !value)} aria-expanded={showConfig}>
-            <span>模型 JSON</span><span>{showConfig ? "收起 −" : "编辑 +"}</span>
-          </button>
-          {showConfig ? (
-            <div className="json-panel">
-              <textarea aria-label="模型 JSON 配置" value={configText} onChange={(e) => setConfigText(e.target.value)} spellCheck={false} />
-              {configError ? <p className="json-error">{configError}</p> : null}
-              <button type="button" onClick={applyConfig}>应用配置</button>
-            </div>
-          ) : null}
         </aside>
 
         <section className="results" aria-live="polite">
           <div className="section-heading light">
             <span>02</span>
-            <div><h2>单卡峰值估算</h2><p>以最繁忙 Pipeline Stage 为准</p></div>
+            <div><h2>单卡峰值估算</h2><p>以最繁忙 PP Rank 为准</p></div>
           </div>
 
           <div className="total-card">
             <div className="total-topline">
               <span className={`status ${status.tone}`}><i />{status.label}</span>
-              <span>{inputs.totalGpus} × {inputs.gpuMemory} GB</span>
+              <span>Peak PP {result.peakRank.rank} · {inputs.totalGpus} × {inputs.gpuMemory} GB</span>
             </div>
             <div className="total-number">
               <strong>{result.total.toFixed(1)}</strong><span>GB / GPU</span>
@@ -416,6 +550,19 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 ? `预计剩余 ${result.headroom.toFixed(1)} GB，可用于通信缓冲或内核临时空间。`
                 : `预计超出 ${Math.abs(result.headroom).toFixed(1)} GB，需要增加并行度或开启更强重计算。`}
             </p>
+            <div className="compact-advice">
+              <b>建议</b>
+              <span>
+                {!result.validTopology
+                  ? "先让 GPU 数量满足 TP × PP × CP 与 EP 的整除关系。"
+                  : result.activation > result.modelState * 0.45
+                    ? "激活占比较高，优先增加 CP 或使用全量重计算。"
+                    : result.headroom < 8
+                      ? "余量偏紧，优先提高 TP / PP / EP 或增加单卡显存。"
+                      : "当前余量健康，建议用实测峰值校准运行时预留。"}
+              </span>
+              {!inputs.distributedOptimizer ? <span>开启分布式优化器可显著降低 Adam 状态。</span> : null}
+            </div>
           </div>
 
           <div className="breakdown">
@@ -440,20 +587,56 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <dl>
                 <div><dt>总参数</dt><dd>{compact(result.totalParams)}B</dd></div>
                 <div><dt>单 token 激活</dt><dd>{compact(result.activeParams)}B</dd></div>
-                <div><dt>单卡本地参数</dt><dd>{compact(result.localParams)}B</dd></div>
-                <div><dt>MoE 专家参数</dt><dd>{compact(result.expertParams)}B</dd></div>
+                <div><dt>峰值 Rank 本地参数</dt><dd>{compact(result.localParams)}B</dd></div>
+                <div><dt>{shape.experts > 0 ? "MoE 专家参数" : "Dense MLP 参数"}</dt><dd>{compact(shape.experts > 0 ? result.expertParams : result.denseMlpParams)}B</dd></div>
                 <div><dt>注意力层</dt><dd>{shape.linearAttentionLayers} Linear + {shape.fullAttentionLayers} Full</dd></div>
-                <div><dt>专家路由</dt><dd>{shape.topK} / {shape.experts}</dd></div>
+                <div><dt>{shape.experts > 0 ? "专家路由" : "前馈层"}</dt><dd>{shape.experts > 0 ? `${shape.topK} / ${shape.experts}` : "Dense gated MLP"}</dd></div>
               </dl>
+              <details className="profile-disclosure">
+                <summary><span>关键网络维度</span><strong>H = {shape.hidden.toLocaleString("en-US")}</strong></summary>
+                <div className="dimension-list">
+                  <div><span>Hidden state</span><code>[B, S, H] = [B, S, {shape.hidden.toLocaleString("en-US")}]</code></div>
+                  <div><span>网络深度</span><code>{shape.layers} blocks + {shape.mtpLayers} MTP</code></div>
+                  <div><span>Full Q / O</span><code>H ↔ {shape.heads} heads × {shape.headDim} dim</code></div>
+                  <div><span>Full K / V</span><code>H → {shape.kvHeads} KV heads × {shape.headDim} dim</code></div>
+                  <div><span>Linear Q / K</span><code>H → {shape.linearKeyHeads} heads × {shape.linearKeyDim} dim</code></div>
+                  <div><span>Linear V / O</span><code>H ↔ {shape.linearValueHeads} heads × {shape.linearValueDim} dim</code></div>
+                  <div><span>{shape.experts > 0 ? "Expert MLP" : "Dense MLP"}</span><code>H → {shape.experts > 0 ? shape.moeIntermediate : shape.denseIntermediate} → H · 3 matrices</code></div>
+                  {shape.experts > 0 ? <div><span>MoE routing</span><code>{shape.experts} experts · TopK {shape.topK} · shared I = {shape.sharedIntermediate}</code></div> : null}
+                  <div><span>Embedding</span><code>V × H = {shape.vocab.toLocaleString("en-US")} × {shape.hidden.toLocaleString("en-US")} · {shape.tied ? "tied" : "untied"}</code></div>
+                </div>
+              </details>
             </article>
-            <article>
-              <div className="detail-title"><span>04</span><h3>优化建议</h3></div>
-              <ul className="recommendations">
-                {!result.validTopology ? <li><b>先修复拓扑</b><span>让 GPU 数量满足并行维度的整除关系。</span></li> : null}
-                {result.activation > result.modelState * 0.45 ? <li><b>激活值占比较高</b><span>优先提高 CP 或使用全量重计算。</span></li> : null}
-                {result.headroom < 8 ? <li><b>保留更多余量</b><span>提高 TP / PP / EP，或换用更大显存 GPU。</span></li> : <li><b>当前余量健康</b><span>建议实测后将额外预留校准到集群环境。</span></li>}
-                {!inputs.distributedOptimizer ? <li><b>开启分布式优化器</b><span>通常能显著降低 Adam 状态占用。</span></li> : null}
-              </ul>
+            <article className="rank-panel">
+              <div className="detail-title"><span>04</span><h3>PP Rank 显存细分</h3></div>
+              <p className="rank-assumption">连续切层；PP 0 在途激活最多，末 Rank 承载 MTP 与输出层。</p>
+              <div className="rank-list">
+                {result.ppRanks.map((rank) => (
+                  <details key={rank.rank} className={`rank-disclosure ${rank.rank === result.peakRank.rank ? "peak" : ""}`} open={rank.rank === result.peakRank.rank}>
+                    <summary>
+                      <span>PP {rank.rank}</span>
+                      <small>{rank.layerCount > 0 ? `L${rank.layerStart}–${rank.layerEnd - 1}` : "No blocks"}</small>
+                      <strong>{gb(rank.total)}</strong>
+                    </summary>
+                    <div className="rank-detail">
+                      <div className="rank-meta">
+                        <span>{rank.linearLayers} Linear</span>
+                        <span>{rank.fullLayers} Full</span>
+                        <span>{rank.pipelineInflight} in-flight</span>
+                        {rank.roles.map((role) => <span key={role}>{role}</span>)}
+                      </div>
+                      <dl>
+                        <div><dt>本地参数</dt><dd>{compact(rank.localParams)}B</dd></div>
+                        <div><dt>模型权重</dt><dd>{gb(rank.modelWeights)}</dd></div>
+                        <div><dt>梯度</dt><dd>{gb(rank.gradients)}</dd></div>
+                        <div><dt>优化器状态</dt><dd>{gb(rank.optimizer)}</dd></div>
+                        <div><dt>激活值</dt><dd>{gb(rank.activation)}</dd></div>
+                        <div><dt>运行时预留</dt><dd>{gb(inputs.overhead)}</dd></div>
+                      </dl>
+                    </div>
+                  </details>
+                ))}
+              </div>
             </article>
           </div>
 
@@ -469,6 +652,64 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <span>P<sub>local</sub> = {compact(result.localParams)}B</span>
               <span>Tokens / GPU = {Math.round(result.tokens).toLocaleString("en-US")}</span>
             </div>
+
+            <section className="parameter-logic" aria-labelledby="parameter-logic-title">
+              <div className="parameter-logic-heading">
+                <h4 id="parameter-logic-title">参数量拆解</h4>
+                <p>先计算全局参数，再按并行维度切分到单卡。</p>
+              </div>
+              <div className="parameter-logic-grid">
+                <article>
+                  <header>
+                    <span>Dense</span>
+                    <strong>{compact(result.denseParams)}B 全局</strong>
+                  </header>
+                  <code>
+                    {shape.experts > 0
+                      ? <>P<sub>dense</sub> = [L<sub>full</sub>P<sub>full</sub> + L<sub>linear</sub>P<sub>linear</sub> + L(P<sub>shared</sub> + P<sub>router</sub> + P<sub>norm</sub>)] × m<sub>MTP</sub> + P<sub>embed</sub></>
+                      : <>P<sub>dense</sub> = [L<sub>full</sub>P<sub>full</sub> + L<sub>linear</sub>P<sub>linear</sub> + L(P<sub>MLP</sub> + P<sub>norm</sub>)] × m<sub>MTP</sub> + P<sub>embed</sub></>}
+                  </code>
+                  <dl>
+                    <div><dt>Full attention：{shape.fullAttentionLayers} 层，Q + KV + O</dt><dd>{compact(result.fullAttentionParams)}B</dd></div>
+                    <div><dt>Linear attention：{shape.linearAttentionLayers} 层，QK + V + O + gates</dt><dd>{compact(result.linearAttentionParams)}B</dd></div>
+                    <div><dt>{shape.experts > 0 ? "共享专家、router、RMSNorm" : "Dense gated MLP、RMSNorm"}</dt><dd>{compact(shape.experts > 0 ? result.denseMoEParams : result.denseMlpParams + result.denseMoEParams)}B</dd></div>
+                    <div><dt>词嵌入{shape.tied ? "（权重绑定）" : "（输入/输出各一份）"}</dt><dd>{compact(result.embedding)}B</dd></div>
+                  </dl>
+                  <p>P<sub>dense,local</sub> = {compact(result.peakRank.denseGlobal)}B on PP {result.peakRank.rank} / {inputs.tp} TP = <b>{compact(result.localDense)}B</b></p>
+                </article>
+                {shape.experts > 0 ? (
+                  <article>
+                    <header>
+                      <span>Experts</span>
+                      <strong>{compact(result.expertParams)}B 全局</strong>
+                    </header>
+                    <code>P<sub>expert</sub> = L × m<sub>MTP</sub> × N<sub>expert</sub> × 3 × H × I<sub>moe</sub></code>
+                    <dl>
+                      <div><dt>每专家 gated MLP：3 × {shape.hidden.toLocaleString("en-US")} × {shape.moeIntermediate.toLocaleString("en-US")}</dt><dd>{compact(result.expertPerLayer / Math.max(shape.experts, 1))}B</dd></div>
+                      <div><dt>每层全部专家：{shape.experts} experts</dt><dd>{compact(result.expertPerLayer)}B</dd></div>
+                      <div><dt>有效层数：{shape.layers} × m<sub>MTP</sub> = {(shape.layers * result.mtpMultiplier).toFixed(0)}</dt><dd>{compact(result.expertParams)}B</dd></div>
+                      <div><dt>TopK = {shape.topK} 仅影响激活专家与激活值</dt><dd>不减少权重</dd></div>
+                    </dl>
+                    <p>P<sub>expert,local</sub> = {compact(result.peakRank.expertGlobal)}B on PP {result.peakRank.rank} / ({inputs.etp} ETP × {inputs.ep} EP) = <b>{compact(result.localExpert)}B</b></p>
+                  </article>
+                ) : (
+                  <article>
+                    <header>
+                      <span>Dense MLP</span>
+                      <strong>{compact(result.denseMlpParams)}B 全局</strong>
+                    </header>
+                    <code>P<sub>MLP</sub> = L × m<sub>MTP</sub> × 3 × H × I<sub>FFN</sub></code>
+                    <dl>
+                      <div><dt>每层 gated MLP：3 × {shape.hidden.toLocaleString("en-US")} × {shape.denseIntermediate.toLocaleString("en-US")}</dt><dd>{compact(result.denseMlpParams / Math.max(shape.layers * result.mtpMultiplier, 1))}B</dd></div>
+                      <div><dt>有效层数：{shape.layers} × m<sub>MTP</sub> = {(shape.layers * result.mtpMultiplier).toFixed(0)}</dt><dd>{compact(result.denseMlpParams)}B</dd></div>
+                      <div><dt>TP 切分前馈层权重与中间激活</dt><dd>{inputs.tp} TP</dd></div>
+                      <div><dt>无独占专家</dt><dd>P<sub>expert</sub> = 0</dd></div>
+                    </dl>
+                    <p>P<sub>MLP,local</sub> 已包含在 P<sub>dense,local</sub> 中；不按 EP 或 ETP 再切分。</p>
+                  </article>
+                )}
+              </div>
+            </section>
 
             <div className="formula-grid">
               <article>
@@ -498,8 +739,8 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <article>
                 <header><span>04</span><h4>激活值</h4><strong>{gb(result.activation)}</strong></header>
                 <code>Tokens = MBS × SeqLen / CP</code>
-                <code>A ≈ (L<sub>full</sub>A<sub>full</sub> + L<sub>linear</sub>A<sub>linear</sub> + LA<sub>moe</sub>) / PP × N<sub>flight</sub> × r</code>
-                <p>N<sub>flight</sub> = {result.pipelineInflight}，r = {result.recomputeFactor.toFixed(2)}；当前为 {gb(result.activation)}</p>
+                <code>A<sub>rank</sub> ≈ (L<sub>full,rank</sub>A<sub>full</sub> + L<sub>linear,rank</sub>A<sub>linear</sub> + L<sub>rank</sub>A<sub>moe</sub>) × N<sub>flight,rank</sub> × r</code>
+                <p>Peak PP {result.peakRank.rank}：N<sub>flight</sub> = {result.pipelineInflight}，r = {result.recomputeFactor.toFixed(2)}；当前为 {gb(result.activation)}</p>
               </article>
             </div>
 
@@ -514,7 +755,11 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <span>{gb(result.linearLayerActivation / GiB)} / layer</span>
               </div>
               <div>
-                <code>A<sub>moe/layer</sub> ≈ Tokens × TopK × I<sub>moe</sub> × 2 / (ETP × EP)</code>
+                <code>
+                  {shape.experts > 0
+                    ? <>A<sub>moe/layer</sub> ≈ Tokens × TopK × I<sub>moe</sub> × 2 / (ETP × EP)</>
+                    : <>A<sub>mlp/layer</sub> ≈ Tokens × I<sub>FFN</sub> × 2 / TP</>}
+                </code>
                 <span>{gb(result.moeActivation / GiB)} / layer</span>
               </div>
             </div>
@@ -543,7 +788,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
           </section>
 
           <p className="method-note">
-            估算口径：BF16 参数 2 B、FP32 主梯度 4 B、Adam FP32 主权重与一二阶矩 12 B；激活值按层类型、序列长度、并行度及重计算策略近似。实际峰值还会受 Megatron 版本、Transformer Engine、Flash Attention、Pipeline 调度、Sequence Parallel、NCCL 缓冲、CUDA Graph 与显存碎片影响，请用训练实测校准“额外预留”。
+            估算口径：BF16 参数 2 B、FP32 主梯度 4 B、Adam FP32 主权重与一二阶矩 12 B；PP Rank 按连续层范围切分，MTP 放在末 Rank，tied embedding 在首尾 Rank 各驻留一份；在途 micro-batch 近似为 PP − rank。实际峰值还会受 Megatron 版本、Pipeline 调度、Sequence Parallel、NCCL 缓冲、CUDA Graph 与显存碎片影响，请用训练实测校准“额外预留”。
           </p>
         </section>
       </section>

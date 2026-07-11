@@ -28,6 +28,10 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /梯度/);
   assert.match(html, /优化器状态/);
   assert.match(html, /激活值/);
+  assert.match(html, /PP Rank 显存细分/);
+  assert.match(html, /关键网络维度/);
+  assert.match(html, /Peak PP/);
+  assert.doesNotMatch(html, /<h3>优化建议<\/h3>/);
   assert.match(html, /粗略估算公式/);
   assert.match(html, /不同配置下的快速对比/);
   assert.match(html, /分布式 Adam/);
