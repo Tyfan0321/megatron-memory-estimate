@@ -139,14 +139,24 @@ function calculate(shape: ModelShape, x: Inputs) {
   const expertDp = Math.max(dp / Math.max(x.ep, 1), 1);
   const localDense = denseParams / Math.max(x.tp * x.pp, 1);
   const localExpert = expertParams / Math.max(x.etp * x.ep * x.pp, 1);
+  const localParams = localDense + localExpert;
 
   // Megatron mixed-precision convention: BF16 weights (2 B), FP32 main grads (4 B),
   // and 12 B of Adam master weights/moments, sharded across data-parallel ranks.
-  const baseBytes = (localDense + localExpert) * 6;
+  const weightBytes = localParams * 2;
+  const gradientBytes = localParams * 4;
+  const optimizerDistributedBytes =
+    localDense * 12 / Math.max(dp, 1) + localExpert * 12 / expertDp;
+  const optimizerReplicatedBytes = localParams * 12;
   const optimizerBytes = x.distributedOptimizer
-    ? localDense * 12 / Math.max(dp, 1) + localExpert * 12 / expertDp
-    : (localDense + localExpert) * 12;
-  const modelState = (baseBytes + optimizerBytes) / GiB;
+    ? optimizerDistributedBytes
+    : optimizerReplicatedBytes;
+  const modelWeights = weightBytes / GiB;
+  const gradients = gradientBytes / GiB;
+  const optimizer = optimizerBytes / GiB;
+  const optimizerDistributed = optimizerDistributedBytes / GiB;
+  const optimizerReplicated = optimizerReplicatedBytes / GiB;
+  const modelState = modelWeights + gradients + optimizer;
 
   const tokens = x.microBatch * x.sequenceLength / Math.max(x.cp, 1);
   const hiddenBytes = tokens * shape.hidden * 2;
@@ -163,7 +173,11 @@ function calculate(shape: ModelShape, x: Inputs) {
     shape.layers * moeActivation;
   const pipelineInflight = Math.max(x.pp, 1);
   const recomputeFactor = x.recompute === "full" ? 0.2 : x.recompute === "selective" ? 0.56 : 1;
-  const activation = savedPerModel / Math.max(x.pp, 1) * pipelineInflight * recomputeFactor / GiB;
+  const activationBase = savedPerModel / Math.max(x.pp, 1) * pipelineInflight / GiB;
+  const activationNoRecompute = activationBase;
+  const activationSelective = activationBase * 0.56;
+  const activationFull = activationBase * 0.2;
+  const activation = activationBase * recomputeFactor;
   const total = modelState + activation + x.overhead;
   const capacity = x.gpuMemory;
 
@@ -172,11 +186,32 @@ function calculate(shape: ModelShape, x: Inputs) {
     activeParams,
     denseParams,
     expertParams,
-    localParams: localDense + localExpert,
+    localDense,
+    localExpert,
+    localParams,
+    modelWeights,
+    gradients,
+    optimizer,
+    optimizerDistributed,
+    optimizerReplicated,
     modelState,
     activation,
+    activationNoRecompute,
+    activationSelective,
+    activationFull,
+    recomputeFactor,
+    tokens,
+    fullLayerActivation,
+    linearLayerActivation,
+    moeActivation,
+    pipelineInflight,
     overhead: x.overhead,
     total,
+    totalNoRecompute: modelState + activationNoRecompute + x.overhead,
+    totalSelective: modelState + activationSelective + x.overhead,
+    totalFull: modelState + activationFull + x.overhead,
+    totalDistributed: modelWeights + gradients + optimizerDistributed + activation + x.overhead,
+    totalReplicated: modelWeights + gradients + optimizerReplicated + activation + x.overhead,
     capacity,
     headroom: capacity - total,
     usage: total / Math.max(capacity, 1) * 100,
@@ -384,9 +419,19 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
           </div>
 
           <div className="breakdown">
-            <article><span>模型状态</span><strong>{gb(result.modelState)}</strong><small>权重 · 主梯度 · Adam</small><div style={{ width: `${result.total ? result.modelState / result.total * 100 : 0}%` }} /></article>
-            <article><span>激活值</span><strong>{gb(result.activation)}</strong><small>{inputs.recompute === "full" ? "全量重计算" : inputs.recompute === "selective" ? "选择性重计算" : "不重计算"}</small><div style={{ width: `${result.total ? result.activation / result.total * 100 : 0}%` }} /></article>
-            <article><span>运行时预留</span><strong>{gb(result.overhead)}</strong><small>NCCL · kernel · 碎片</small><div style={{ width: `${result.total ? result.overhead / result.total * 100 : 0}%` }} /></article>
+            <article className="weights"><span>模型权重</span><strong>{gb(result.modelWeights)}</strong><small>BF16 · 2 B / param</small><div style={{ width: `${result.total ? result.modelWeights / result.total * 100 : 0}%` }} /></article>
+            <article className="gradients"><span>梯度</span><strong>{gb(result.gradients)}</strong><small>FP32 main grad · 4 B / param</small><div style={{ width: `${result.total ? result.gradients / result.total * 100 : 0}%` }} /></article>
+            <article className="optimizer"><span>优化器状态</span><strong>{gb(result.optimizer)}</strong><small>{inputs.distributedOptimizer ? "Distributed Adam" : "Replicated Adam"} · 12 B</small><div style={{ width: `${result.total ? result.optimizer / result.total * 100 : 0}%` }} /></article>
+            <article className="activations"><span>激活值</span><strong>{gb(result.activation)}</strong><small>{inputs.recompute === "full" ? "全量重计算" : inputs.recompute === "selective" ? "选择性重计算" : "不重计算"}</small><div style={{ width: `${result.total ? result.activation / result.total * 100 : 0}%` }} /></article>
+            <article className="runtime"><span>运行时预留</span><strong>{gb(result.overhead)}</strong><small>NCCL · kernel · 碎片</small><div style={{ width: `${result.total ? result.overhead / result.total * 100 : 0}%` }} /></article>
+          </div>
+
+          <div className="composition" aria-label="显存组成比例">
+            <span className="weights" style={{ width: `${result.modelWeights / result.total * 100}%` }} title={`模型权重 ${gb(result.modelWeights)}`} />
+            <span className="gradients" style={{ width: `${result.gradients / result.total * 100}%` }} title={`梯度 ${gb(result.gradients)}`} />
+            <span className="optimizer" style={{ width: `${result.optimizer / result.total * 100}%` }} title={`优化器 ${gb(result.optimizer)}`} />
+            <span className="activations" style={{ width: `${result.activation / result.total * 100}%` }} title={`激活值 ${gb(result.activation)}`} />
+            <span className="runtime" style={{ width: `${result.overhead / result.total * 100}%` }} title={`运行时预留 ${gb(result.overhead)}`} />
           </div>
 
           <div className="details-grid">
@@ -412,8 +457,93 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
             </article>
           </div>
 
+          <section className="formula-section" aria-labelledby="formula-title">
+            <div className="formula-heading">
+              <div className="detail-title"><span>05</span><h3 id="formula-title">粗略估算公式</h3></div>
+              <p>公式会随当前并行拓扑、序列长度和内存策略实时更新。</p>
+            </div>
+
+            <div className="formula-context">
+              <span>P<sub>dense,local</sub> = {compact(result.localDense)}B</span>
+              <span>P<sub>expert,local</sub> = {compact(result.localExpert)}B</span>
+              <span>P<sub>local</sub> = {compact(result.localParams)}B</span>
+              <span>Tokens / GPU = {Math.round(result.tokens).toLocaleString("en-US")}</span>
+            </div>
+
+            <div className="formula-grid">
+              <article>
+                <header><span>01</span><h4>模型权重</h4><strong>{gb(result.modelWeights)}</strong></header>
+                <code>M<sub>weight</sub> = P<sub>local</sub> × 2 B ÷ 2³⁰</code>
+                <p>{compact(result.localParams)}B × 2 B ÷ 2³⁰ = {gb(result.modelWeights)}</p>
+              </article>
+              <article>
+                <header><span>02</span><h4>梯度</h4><strong>{gb(result.gradients)}</strong></header>
+                <code>M<sub>grad</sub> = P<sub>local</sub> × 4 B ÷ 2³⁰</code>
+                <p>{compact(result.localParams)}B × 4 B ÷ 2³⁰ = {gb(result.gradients)}</p>
+              </article>
+              <article>
+                <header><span>03</span><h4>优化器状态</h4><strong>{gb(result.optimizer)}</strong></header>
+                {inputs.distributedOptimizer ? (
+                  <>
+                    <code>M<sub>optim</sub> = (P<sub>dense</sub> × 12 / DP + P<sub>expert</sub> × 12 / EDP) ÷ 2³⁰</code>
+                    <p>EDP = DP / EP = {result.expertDp.toFixed(0)}；当前为 {gb(result.optimizer)}</p>
+                  </>
+                ) : (
+                  <>
+                    <code>M<sub>optim</sub> = P<sub>local</sub> × 12 B ÷ 2³⁰</code>
+                    <p>未切分 Adam 主权重与一二阶矩；当前为 {gb(result.optimizer)}</p>
+                  </>
+                )}
+              </article>
+              <article>
+                <header><span>04</span><h4>激活值</h4><strong>{gb(result.activation)}</strong></header>
+                <code>Tokens = MBS × SeqLen / CP</code>
+                <code>A ≈ (L<sub>full</sub>A<sub>full</sub> + L<sub>linear</sub>A<sub>linear</sub> + LA<sub>moe</sub>) / PP × N<sub>flight</sub> × r</code>
+                <p>N<sub>flight</sub> = {result.pipelineInflight}，r = {result.recomputeFactor.toFixed(2)}；当前为 {gb(result.activation)}</p>
+              </article>
+            </div>
+
+            <div className="activation-formulas">
+              <h4>激活值分层近似</h4>
+              <div>
+                <code>A<sub>full/layer</sub> ≈ Tokens × H × 2 × (4 + 12 / TP)</code>
+                <span>{gb(result.fullLayerActivation / GiB)} / layer</span>
+              </div>
+              <div>
+                <code>A<sub>linear/layer</sub> ≈ Tokens × H × 2 × (3.5 + 9 / TP) + Tokens × V × 2 / TP</code>
+                <span>{gb(result.linearLayerActivation / GiB)} / layer</span>
+              </div>
+              <div>
+                <code>A<sub>moe/layer</sub> ≈ Tokens × TopK × I<sub>moe</sub> × 2 / (ETP × EP)</code>
+                <span>{gb(result.moeActivation / GiB)} / layer</span>
+              </div>
+            </div>
+
+            <div className="scenario-heading">
+              <h4>不同配置下的快速对比</h4>
+              <p>其他输入保持当前值，仅切换对应策略。</p>
+            </div>
+            <div className="scenario-grid">
+              <article><span>不重计算</span><strong>{gb(result.totalNoRecompute)}</strong><small>激活 {gb(result.activationNoRecompute)} · r = 1.00</small></article>
+              <article><span>选择性重计算</span><strong>{gb(result.totalSelective)}</strong><small>激活 {gb(result.activationSelective)} · r ≈ 0.56</small></article>
+              <article><span>全量重计算</span><strong>{gb(result.totalFull)}</strong><small>激活 {gb(result.activationFull)} · r ≈ 0.20</small></article>
+              <article><span>分布式 Adam</span><strong>{gb(result.totalDistributed)}</strong><small>优化器 {gb(result.optimizerDistributed)}</small></article>
+              <article><span>常规 Adam</span><strong>{gb(result.totalReplicated)}</strong><small>优化器 {gb(result.optimizerReplicated)}</small></article>
+            </div>
+
+            <div className="effect-table" role="table" aria-label="配置参数如何影响显存公式">
+              <div className="effect-row header" role="row"><span role="columnheader">配置</span><span role="columnheader">主要作用项</span><span role="columnheader">粗略关系</span></div>
+              <div className="effect-row" role="row"><b role="cell">TP</b><span role="cell">Dense 权重、注意力激活</span><code role="cell">P<sub>dense</sub> ∝ 1/TP；部分 A ∝ 1/TP</code></div>
+              <div className="effect-row" role="row"><b role="cell">PP</b><span role="cell">每个 Stage 的层参数</span><code role="cell">P<sub>layer</sub> ∝ 1/PP；激活受在途 micro-batch 影响</code></div>
+              <div className="effect-row" role="row"><b role="cell">EP × ETP</b><span role="cell">MoE 专家权重与中间激活</span><code role="cell">P<sub>expert</sub>, A<sub>moe</sub> ∝ 1/(EP × ETP)</code></div>
+              <div className="effect-row" role="row"><b role="cell">CP</b><span role="cell">每卡 token 与激活值</span><code role="cell">Tokens = MBS × SeqLen / CP</code></div>
+              <div className="effect-row" role="row"><b role="cell">DP</b><span role="cell">分布式优化器状态</span><code role="cell">M<sub>optim,dense</sub> ∝ 1/DP</code></div>
+              <div className="effect-row" role="row"><b role="cell">MBS × SeqLen</b><span role="cell">激活值</span><code role="cell">A ≈ O(MBS × SeqLen)，具体受内核与层类型影响</code></div>
+            </div>
+          </section>
+
           <p className="method-note">
-            估算口径：BF16 参数 2 B、FP32 主梯度 4 B、Adam 主权重与一二阶矩 12 B；激活值按层类型、序列长度、并行度及重计算策略建模。结果不包含框架外的固定占用，已通过“额外预留”单独计入。
+            估算口径：BF16 参数 2 B、FP32 主梯度 4 B、Adam FP32 主权重与一二阶矩 12 B；激活值按层类型、序列长度、并行度及重计算策略近似。实际峰值还会受 Megatron 版本、Transformer Engine、Flash Attention、Pipeline 调度、Sequence Parallel、NCCL 缓冲、CUDA Graph 与显存碎片影响，请用训练实测校准“额外预留”。
           </p>
         </section>
       </section>

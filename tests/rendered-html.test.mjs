@@ -24,8 +24,14 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /在启动训练前/);
   assert.match(html, /Qwen3_5Moe/);
   assert.match(html, /64<!-- --> × <!-- -->80<!-- --> GB/);
-  assert.match(html, /模型状态/);
+  assert.match(html, /模型权重/);
+  assert.match(html, /梯度/);
+  assert.match(html, /优化器状态/);
   assert.match(html, /激活值/);
+  assert.match(html, /粗略估算公式/);
+  assert.match(html, /不同配置下的快速对比/);
+  assert.match(html, /分布式 Adam/);
+  assert.match(html, /常规 Adam/);
   assert.match(html, /https:\/\/memory\.example\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
