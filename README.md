@@ -1,98 +1,79 @@
-# vinext-starter
+# Megatron SFT 显存估算器
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+面向 Megatron-LM 全参数 SFT 的浏览器端显存规划工具。根据模型结构、GPU 规格、批次设置和并行拓扑，估算最繁忙 Pipeline Stage 的单卡峰值显存。
 
-## Prerequisites
+## 功能
 
-- Node.js `>=22.13.0`
+- 内置 Qwen3.5 Dense 与 MoE 模型配置，也可直接编辑 Hugging Face 风格的模型 JSON。
+- 支持 TP、PP、DP、CP、EP、ETP 等并行维度及拓扑合法性检查。
+- 分别估算模型权重、梯度、Adam 优化器状态、激活值和运行时预留。
+- 对比关闭、选择性和全量激活重计算，以及分布式与常规 Adam 的显存差异。
+- 展示各 PP Rank 的层分配、参数分布和峰值显存，便于定位不均衡 Stage。
+- 提供参数量拆解、关键网络维度和并行策略说明。
 
-## Quick Start
+## 本地运行
+
+需要 Node.js `>=22.13.0`。
 
 ```bash
 npm install
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+其他常用命令：
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm run lint   # 静态检查
+npm run build  # 生产构建
+npm test       # 构建并检查服务端渲染结果
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+## 使用方式
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+1. 从 Qwen3.5 Collection 选择预设，或展开“模型 JSON”粘贴自定义配置。
+2. 设置 GPU 数量、单卡显存、Micro Batch 和序列长度。
+3. 配置 TP、PP、EP、CP、ETP；DP 根据 GPU 总数自动计算。
+4. 选择激活重计算和分布式优化器策略，并设置额外运行时预留。
+5. 查看单卡峰值、显存组成、PP Rank 细分和不同策略下的快速对比。
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+默认模型配置位于 [`config.json`](./config.json)。自定义 JSON 可以将模型字段放在顶层，也可以放在 `text_config` 中。常用字段包括：
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+- 基础结构：`hidden_size`、`num_hidden_layers`、`num_attention_heads`、`num_key_value_heads`、`vocab_size`
+- Dense MLP：`intermediate_size`
+- MoE：`num_experts`、`num_experts_per_tok`、`moe_intermediate_size`、`shared_expert_intermediate_size`
+- 混合注意力：`layer_types`、`head_dim` 及 `linear_*` 字段
+- 其他：`tie_word_embeddings`、`mtp_num_hidden_layers`
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+## 估算口径
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+估算器以 BF16 全参数训练为默认口径：
 
-## Useful Commands
+- 模型权重：每参数 2 Bytes
+- FP32 主梯度：每参数 4 Bytes
+- FP32 主权重与 Adam 一、二阶状态：每参数 12 Bytes
+- 分布式优化器：Dense 状态按 DP 切分，专家状态按专家数据并行域切分
+- 激活值：根据层类型、每卡 Token 数、并行维度、Pipeline 在途数量和重计算策略近似估算
+- 单卡峰值：取所有 PP Rank 中总占用最高的 Rank，并计入用户设置的运行时预留
 
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+拓扑关系为：
 
-## Learn More
+```text
+DP = GPU 总数 / (TP × PP × CP)
+专家数据并行度 = DP / EP
+每卡 Tokens = Micro Batch × Sequence Length / CP
+```
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+内部按 `1024³ Bytes` 换算容量，界面统一显示为 GB。
+
+## 注意事项
+
+结果用于训练方案的前期规划，不等同于实际运行峰值。CUDA/NCCL 缓冲、算子实现、张量对齐、激活生命周期、通信重叠、框架版本和显存碎片都会影响真实占用。建议保留足够余量，并用目标集群上的短任务实测校准“单卡额外预留”。
+
+当前参数量与显存估算仅覆盖文本模型部分，不包含视觉编码器。
+
+## 主要文件
+
+- [`app/Estimator.tsx`](./app/Estimator.tsx)：估算逻辑与交互界面
+- [`app/qwen35-presets.ts`](./app/qwen35-presets.ts)：Qwen3.5 模型预设
+- [`config.json`](./config.json)：默认模型配置
+- [`app/globals.css`](./app/globals.css)：页面样式

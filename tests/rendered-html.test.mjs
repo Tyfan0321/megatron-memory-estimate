@@ -21,7 +21,7 @@ test("server-renders the Megatron memory estimator", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>Megatron SFT 显存估算器<\/title>/i);
-  assert.match(html, /在启动训练前/);
+  assert.match(html, /看清每一GB/);
   assert.match(html, /Qwen3_5Moe/);
   assert.match(html, /64<!-- --> × <!-- -->80<!-- --> GB/);
   assert.match(html, /模型权重/);

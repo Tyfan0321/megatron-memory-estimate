@@ -478,7 +478,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
       <section className="hero" id="top">
         <div>
           <p className="eyebrow">FULL-PARAMETER SFT · MEMORY ESTIMATE</p>
-          <h1>在启动训练前，<br />先看清每一 GB。</h1>
+          <h1>看清每一GB</h1>
         </div>
         <div className="hero-copy">
           <p>
