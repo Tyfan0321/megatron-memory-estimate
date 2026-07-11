@@ -59,6 +59,79 @@ const DEFAULT_INPUTS: Inputs = {
   overhead: 10,
 };
 
+const PARALLEL_GUIDE = [
+  {
+    id: "TP",
+    name: "Tensor Parallel",
+    summary: "切分层内矩阵",
+    effect: "沿隐藏维或 FFN 维切分注意力与 MLP 权重，每层通过集合通信拼接结果。",
+    advantage: "直接降低单卡权重、梯度和部分激活；单层放不下时最有效。",
+    tradeoff: "每层都有 All-Reduce / All-Gather，跨节点扩展容易受带宽和时延限制。",
+    fit: "大 hidden / 大 FFN 模型；优先放在 NVLink 或 NVSwitch 域内。",
+    relation: "P_dense ∝ 1 / TP；部分 activation ∝ 1 / TP",
+  },
+  {
+    id: "PP",
+    name: "Pipeline Parallel",
+    summary: "按连续层切 Stage",
+    effect: "把 Transformer 层连续分配到多个 Stage，只在 Stage 边界传递激活与梯度。",
+    advantage: "通信频率低于 TP，适合跨节点扩展；模型越深越容易均衡切层。",
+    tradeoff: "存在 pipeline bubble、在途激活和首尾层不均衡，需要足够 micro-batch 隐藏空泡。",
+    fit: "深层模型、多节点训练，或 TP 已达到单机高速互联上限时。",
+    relation: "P_layer ≈ 1 / PP；activation 受 layers/rank 与 in-flight 共同影响",
+  },
+  {
+    id: "DP",
+    name: "Data Parallel",
+    summary: "复制模型、切分 Batch",
+    effect: "每个 DP Rank 持有同一份模型并处理不同样本，反向后同步梯度。",
+    advantage: "吞吐扩展直接；配合 Distributed Optimizer 可按 DP 切分 Adam 状态。",
+    tradeoff: "权重与梯度仍复制，梯度同步量大；全局 Batch 会随 DP 增长。",
+    fit: "模型已能放入一个模型并行组，希望增加吞吐与数据规模时。",
+    relation: "M_optim,dense ∝ 1 / DP；weights 不随普通 DP 降低",
+  },
+  {
+    id: "CP",
+    name: "Context Parallel",
+    summary: "切分序列长度",
+    effect: "把同一序列的 token 分到多个 Rank，协同完成长上下文注意力计算。",
+    advantage: "直接降低每卡 token、注意力激活与长序列中间状态。",
+    tradeoff: "引入注意力 P2P / All-to-All 通信，依赖内核支持并增加调度复杂度。",
+    fit: "长上下文训练中 activation 或 attention workspace 成为主要瓶颈时。",
+    relation: "Tokens/GPU = MBS × SeqLen / CP",
+  },
+  {
+    id: "EP",
+    name: "Expert Parallel",
+    summary: "跨 Rank 分布专家",
+    effect: "把不同 MoE 专家放到不同 Rank，token 经路由后通过 All-to-All 发往目标专家。",
+    advantage: "显著降低单卡独占专家权重，并可随专家数量扩展总容量。",
+    tradeoff: "token dispatch 通信重且易受负载不均影响；专家数据并行域缩小为 DP / EP。",
+    fit: "专家数量多、路由较均衡且集群具备高带宽 All-to-All 的 MoE 模型。",
+    relation: "P_expert ∝ 1 / EP；EDP = DP / EP",
+  },
+  {
+    id: "ETP",
+    name: "Expert Tensor Parallel",
+    summary: "切分单个专家 MLP",
+    effect: "在一个专家内部继续切分 gate / up / down 投影，和 EP 的专家分布正交组合。",
+    advantage: "当单个专家仍过大时继续降低专家权重与中间激活。",
+    tradeoff: "增加专家内部集合通信，EP × ETP 拓扑和通信组配置更复杂。",
+    fit: "专家 FFN 本身较大；通常让 ETP 留在单机高速互联域内。",
+    relation: "P_expert, A_moe ∝ 1 / (EP × ETP)",
+  },
+  {
+    id: "SP",
+    name: "Sequence Parallel",
+    summary: "随 TP 切非线性激活",
+    effect: "沿序列维切分 LayerNorm、Dropout 等未被 TP 切分的激活，通常与 TP 联动。",
+    advantage: "进一步降低每卡 activation，并减少 TP 区域中的重复激活存储。",
+    tradeoff: "在层边界增加 Reduce-Scatter / All-Gather；不能独立替代 TP 或 CP。",
+    fit: "TP > 1 且激活占比较高的 Megatron 训练；当前估算将其并入 TP 近似。",
+    relation: "A_norm/dropout ≈ 1 / TP（启用 SP 时）",
+  },
+] as const;
+
 const GiB = 1024 ** 3;
 const n = (value: unknown, fallback = 0) =>
   typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -524,6 +597,32 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
             <NumberField label="单卡额外预留" value={inputs.overhead} min={0} suffix="GB" onChange={(v) => update("overhead", v)} />
           </div>
 
+          <section className="parallel-guide" aria-labelledby="parallel-guide-title">
+            <div className="parallel-guide-heading">
+              <div><span>REFERENCE</span><h3 id="parallel-guide-title">并行策略作用表</h3></div>
+              <small>固定参考</small>
+            </div>
+            <div className="parallel-guide-list">
+              {PARALLEL_GUIDE.map((method) => (
+                <details key={method.id} className="parallel-method" open={method.id === "TP"}>
+                  <summary>
+                    <code>{method.id}</code>
+                    <span><strong>{method.name}</strong><small>{method.summary}</small></span>
+                  </summary>
+                  <div className="parallel-method-body">
+                    <dl>
+                      <div><dt>作用</dt><dd>{method.effect}</dd></div>
+                      <div><dt>优势</dt><dd>{method.advantage}</dd></div>
+                      <div><dt>代价</dt><dd>{method.tradeoff}</dd></div>
+                      <div><dt>适用</dt><dd>{method.fit}</dd></div>
+                    </dl>
+                    <code>{method.relation}</code>
+                  </div>
+                </details>
+              ))}
+            </div>
+          </section>
+
         </aside>
 
         <section className="results" aria-live="polite">
@@ -776,15 +875,6 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <article><span>常规 Adam</span><strong>{gb(result.totalReplicated)}</strong><small>优化器 {gb(result.optimizerReplicated)}</small></article>
             </div>
 
-            <div className="effect-table" role="table" aria-label="配置参数如何影响显存公式">
-              <div className="effect-row header" role="row"><span role="columnheader">配置</span><span role="columnheader">主要作用项</span><span role="columnheader">粗略关系</span></div>
-              <div className="effect-row" role="row"><b role="cell">TP</b><span role="cell">Dense 权重、注意力激活</span><code role="cell">P<sub>dense</sub> ∝ 1/TP；部分 A ∝ 1/TP</code></div>
-              <div className="effect-row" role="row"><b role="cell">PP</b><span role="cell">每个 Stage 的层参数</span><code role="cell">P<sub>layer</sub> ∝ 1/PP；激活受在途 micro-batch 影响</code></div>
-              <div className="effect-row" role="row"><b role="cell">EP × ETP</b><span role="cell">MoE 专家权重与中间激活</span><code role="cell">P<sub>expert</sub>, A<sub>moe</sub> ∝ 1/(EP × ETP)</code></div>
-              <div className="effect-row" role="row"><b role="cell">CP</b><span role="cell">每卡 token 与激活值</span><code role="cell">Tokens = MBS × SeqLen / CP</code></div>
-              <div className="effect-row" role="row"><b role="cell">DP</b><span role="cell">分布式优化器状态</span><code role="cell">M<sub>optim,dense</sub> ∝ 1/DP</code></div>
-              <div className="effect-row" role="row"><b role="cell">MBS × SeqLen</b><span role="cell">激活值</span><code role="cell">A ≈ O(MBS × SeqLen)，具体受内核与层类型影响</code></div>
-            </div>
           </section>
 
           <p className="method-note">
