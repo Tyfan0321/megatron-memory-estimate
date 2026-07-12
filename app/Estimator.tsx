@@ -393,6 +393,25 @@ const compact = (value: number) => {
 };
 const gb = (value: number) => `${value.toFixed(1)} GB`;
 
+function formatLayerRanges(indices: number[]) {
+  if (indices.length === 0) return "无";
+  const ranges: string[] = [];
+  let start = indices[0];
+  let end = indices[0];
+
+  for (const index of indices.slice(1)) {
+    if (index === end + 1) {
+      end = index;
+      continue;
+    }
+    ranges.push(start === end ? `L${start}` : `L${start}–L${end}`);
+    start = index;
+    end = index;
+  }
+  ranges.push(start === end ? `L${start}` : `L${start}–L${end}`);
+  return ranges.join("、");
+}
+
 function NumberField({
   label,
   value,
@@ -433,6 +452,13 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
   const shape = useMemo(() => shapeFromConfig(config), [config]);
   const result = useMemo(() => calculate(shape, inputs), [shape, inputs]);
   const selectedPreset = QWEN35_COLLECTION.find((preset) => preset.id === selectedPresetId);
+  const fullLayerSources = formatLayerRanges(
+    shape.layerTypes.map((type, index) => type === "full_attention" ? index : -1).filter((index) => index >= 0),
+  );
+  const linearLayerSources = formatLayerRanges(
+    shape.layerTypes.map((type, index) => type !== "full_attention" ? index : -1).filter((index) => index >= 0),
+  );
+  const allLayerSources = shape.layers > 0 ? `L0–L${shape.layers - 1}` : "无";
   const update = <K extends keyof Inputs>(key: K, value: Inputs[K]) =>
     setInputs((current) => ({ ...current, [key]: value }));
 
@@ -611,6 +637,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <div className="activation-topic-body">
                   <code>A<sub>full/layer</sub> ≈ Tokens × H × 2 × (4 + 12 / TP)</code>
                   <dl>
+                    <div><dt>来源层</dt><dd><code>layer_types = full_attention</code>：{fullLayerSources}</dd></div>
                     <div><dt>Tokens</dt><dd>MBS × SeqLen / CP = {Math.round(result.tokens).toLocaleString("en-US")}</dd></div>
                     <div><dt>H × 2</dt><dd>hidden elements × BF16 2 Bytes；当前 H = {shape.hidden.toLocaleString("en-US")}</dd></div>
                     <div><dt>4</dt><dd>约 4 份不随 TP 完全切分的 hidden-size 激活，如层输入、残差与归一化结果。</dd></div>
@@ -627,6 +654,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <div className="activation-topic-body">
                   <code>A<sub>linear/layer</sub> ≈ Tokens × H × 2 × (3.5 + 9 / TP) + Tokens × V × 2 / TP</code>
                   <dl>
+                    <div><dt>来源层</dt><dd><code>layer_types = linear_attention</code>：{linearLayerSources}</dd></div>
                     <div><dt>3.5</dt><dd>残差、归一化、门控等不完全随 TP 切分的 hidden-size 等效激活。</dd></div>
                     <div><dt>9 / TP</dt><dd>可沿 TP 切分的线性注意力投影与反向保存项。</dd></div>
                     <div><dt>V</dt><dd>value heads × value dim = {shape.linearValueHeads} × {shape.linearValueDim} = {(shape.linearValueHeads * shape.linearValueDim).toLocaleString("en-US")}</dd></div>
@@ -647,6 +675,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                   </code>
                   {shape.experts > 0 ? (
                     <dl>
+                      <div><dt>来源层</dt><dd>{allLayerSources} 每个 Transformer block 的 routed experts。</dd></div>
                       <div><dt>TopK</dt><dd>每 token 路由到 {shape.topK} 个专家，专家中间激活相应复制 {shape.topK} 份。</dd></div>
                       <div><dt>I_moe × 2</dt><dd>专家 intermediate width {shape.moeIntermediate.toLocaleString("en-US")} × BF16 2 Bytes。</dd></div>
                       <div><dt>EP</dt><dd>假设路由均衡，每个 EP Rank 接收约 1 / {inputs.ep} 的 routed tokens。</dd></div>
@@ -655,6 +684,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                     </dl>
                   ) : (
                     <dl>
+                      <div><dt>来源层</dt><dd>{allLayerSources} 每个 Transformer block 的 Dense gated MLP。</dd></div>
                       <div><dt>I_FFN × 2</dt><dd>Dense MLP intermediate width {shape.denseIntermediate.toLocaleString("en-US")} × BF16 2 Bytes。</dd></div>
                       <div><dt>TP</dt><dd>中间维按 TP={inputs.tp} 切分，不经过 EP 或 ETP。</dd></div>
                       <div><dt>未计入</dt><dd>融合 SwiGLU 内核临时量、通信 workspace 与实现相关的额外保存 Tensor。</dd></div>
@@ -670,6 +700,7 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <div className="activation-topic-body">
                   <code>A<sub>rank</sub> ≈ Σ(L<sub>type,rank</sub> × A<sub>type/layer</sub>) × N<sub>flight,rank</sub> × r</code>
                   <dl>
+                    <div><dt>来源层</dt><dd>Peak PP {result.peakRank.rank}：{result.peakRank.layerCount > 0 ? `L${result.peakRank.layerStart}–L${result.peakRank.layerEnd - 1}` : "无基础层"}{result.peakRank.mtpLayers > 0 ? `，另含 MTP × ${result.peakRank.mtpLayers}` : ""}。</dd></div>
                     <div><dt>层数</dt><dd>分别累计该 Rank 实际持有的 Full、Linear 与 MLP / MoE 层。</dd></div>
                     <div><dt>N_flight</dt><dd>近似为 PP − rank；当前 Peak Rank 为 {result.pipelineInflight} 个在途 micro-batch。</dd></div>
                     <div><dt>r</dt><dd>不重计算 1.00、选择性重计算 0.56、全量重计算 0.20；当前 {result.recomputeFactor.toFixed(2)}。</dd></div>
