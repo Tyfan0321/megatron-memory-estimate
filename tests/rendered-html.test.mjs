@@ -34,6 +34,9 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /并行策略作用表/);
   assert.match(html, /Expert Tensor Parallel/);
   assert.match(html, /Sequence Parallel/);
+  assert.match(html, /激活值分层近似/);
+  assert.match(html, /PP Rank 汇总/);
+  assert.match(html, /All-to-All buffer/);
   assert.doesNotMatch(html, /配置参数如何影响显存公式/);
   assert.doesNotMatch(html, /<h3>优化建议<\/h3>/);
   assert.match(html, /粗略估算公式/);

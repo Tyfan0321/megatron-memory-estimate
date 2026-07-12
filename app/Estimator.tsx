@@ -597,6 +597,89 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
             <NumberField label="单卡额外预留" value={inputs.overhead} min={0} suffix="GB" onChange={(v) => update("overhead", v)} />
           </div>
 
+          <section className="activation-guide" aria-labelledby="activation-guide-title">
+            <div className="activation-guide-heading">
+              <div><span>MEMORY MODEL</span><h3 id="activation-guide-title">激活值分层近似</h3></div>
+              <small>单层 · 单 micro-batch</small>
+            </div>
+            <div className="activation-guide-list">
+              <details className="activation-topic">
+                <summary>
+                  <span><strong>Full Attention</strong><small>A<sub>full/layer</sub></small></span>
+                  <b>{gb(result.fullLayerActivation / GiB)}</b>
+                </summary>
+                <div className="activation-topic-body">
+                  <code>A<sub>full/layer</sub> ≈ Tokens × H × 2 × (4 + 12 / TP)</code>
+                  <dl>
+                    <div><dt>Tokens</dt><dd>MBS × SeqLen / CP = {Math.round(result.tokens).toLocaleString("en-US")}</dd></div>
+                    <div><dt>H × 2</dt><dd>hidden elements × BF16 2 Bytes；当前 H = {shape.hidden.toLocaleString("en-US")}</dd></div>
+                    <div><dt>4</dt><dd>约 4 份不随 TP 完全切分的 hidden-size 激活，如层输入、残差与归一化结果。</dd></div>
+                    <div><dt>12 / TP</dt><dd>约 12 份可沿 TP 切分的注意力投影及反向所需等效激活。</dd></div>
+                    <div><dt>假设</dt><dd>使用 Flash Attention 类内核，不保存完整的 SeqLen × SeqLen 注意力矩阵。</dd></div>
+                  </dl>
+                </div>
+              </details>
+              <details className="activation-topic">
+                <summary>
+                  <span><strong>Linear Attention</strong><small>A<sub>linear/layer</sub></small></span>
+                  <b>{gb(result.linearLayerActivation / GiB)}</b>
+                </summary>
+                <div className="activation-topic-body">
+                  <code>A<sub>linear/layer</sub> ≈ Tokens × H × 2 × (3.5 + 9 / TP) + Tokens × V × 2 / TP</code>
+                  <dl>
+                    <div><dt>3.5</dt><dd>残差、归一化、门控等不完全随 TP 切分的 hidden-size 等效激活。</dd></div>
+                    <div><dt>9 / TP</dt><dd>可沿 TP 切分的线性注意力投影与反向保存项。</dd></div>
+                    <div><dt>V</dt><dd>value heads × value dim = {shape.linearValueHeads} × {shape.linearValueDim} = {(shape.linearValueHeads * shape.linearValueDim).toLocaleString("en-US")}</dd></div>
+                    <div><dt>特点</dt><dd>不显式保存二次复杂度的注意力矩阵，但需保留线性状态与门控中间量。</dd></div>
+                  </dl>
+                </div>
+              </details>
+              <details className="activation-topic">
+                <summary>
+                  <span><strong>{shape.experts > 0 ? "MoE Experts" : "Dense MLP"}</strong><small>A<sub>{shape.experts > 0 ? "moe" : "mlp"}/layer</sub></small></span>
+                  <b>{gb(result.moeActivation / GiB)}</b>
+                </summary>
+                <div className="activation-topic-body">
+                  <code>
+                    {shape.experts > 0
+                      ? <>A<sub>moe/layer</sub> ≈ Tokens × TopK × I<sub>moe</sub> × 2 / (ETP × EP)</>
+                      : <>A<sub>mlp/layer</sub> ≈ Tokens × I<sub>FFN</sub> × 2 / TP</>}
+                  </code>
+                  {shape.experts > 0 ? (
+                    <dl>
+                      <div><dt>TopK</dt><dd>每 token 路由到 {shape.topK} 个专家，专家中间激活相应复制 {shape.topK} 份。</dd></div>
+                      <div><dt>I_moe × 2</dt><dd>专家 intermediate width {shape.moeIntermediate.toLocaleString("en-US")} × BF16 2 Bytes。</dd></div>
+                      <div><dt>EP</dt><dd>假设路由均衡，每个 EP Rank 接收约 1 / {inputs.ep} 的 routed tokens。</dd></div>
+                      <div><dt>ETP</dt><dd>单个专家 intermediate 维再切为 {inputs.etp} 份。</dd></div>
+                      <div><dt>未计入</dt><dd>Shared Expert、Router logits、dispatch metadata、负载偏斜和 All-to-All buffer。</dd></div>
+                    </dl>
+                  ) : (
+                    <dl>
+                      <div><dt>I_FFN × 2</dt><dd>Dense MLP intermediate width {shape.denseIntermediate.toLocaleString("en-US")} × BF16 2 Bytes。</dd></div>
+                      <div><dt>TP</dt><dd>中间维按 TP={inputs.tp} 切分，不经过 EP 或 ETP。</dd></div>
+                      <div><dt>未计入</dt><dd>融合 SwiGLU 内核临时量、通信 workspace 与实现相关的额外保存 Tensor。</dd></div>
+                    </dl>
+                  )}
+                </div>
+              </details>
+              <details className="activation-topic">
+                <summary>
+                  <span><strong>PP Rank 汇总</strong><small>A<sub>rank</sub></small></span>
+                  <b>Peak PP {result.peakRank.rank}</b>
+                </summary>
+                <div className="activation-topic-body">
+                  <code>A<sub>rank</sub> ≈ Σ(L<sub>type,rank</sub> × A<sub>type/layer</sub>) × N<sub>flight,rank</sub> × r</code>
+                  <dl>
+                    <div><dt>层数</dt><dd>分别累计该 Rank 实际持有的 Full、Linear 与 MLP / MoE 层。</dd></div>
+                    <div><dt>N_flight</dt><dd>近似为 PP − rank；当前 Peak Rank 为 {result.pipelineInflight} 个在途 micro-batch。</dd></div>
+                    <div><dt>r</dt><dd>不重计算 1.00、选择性重计算 0.56、全量重计算 0.20；当前 {result.recomputeFactor.toFixed(2)}。</dd></div>
+                    <div><dt>结果</dt><dd>Peak PP {result.peakRank.rank} 当前激活约 {gb(result.activation)}。</dd></div>
+                  </dl>
+                </div>
+              </details>
+            </div>
+          </section>
+
           <section className="parallel-guide" aria-labelledby="parallel-guide-title">
             <div className="parallel-guide-heading">
               <div><span>REFERENCE</span><h3 id="parallel-guide-title">并行策略作用表</h3></div>
@@ -841,26 +924,6 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <code>A<sub>rank</sub> ≈ (L<sub>full,rank</sub>A<sub>full</sub> + L<sub>linear,rank</sub>A<sub>linear</sub> + L<sub>rank</sub>A<sub>moe</sub>) × N<sub>flight,rank</sub> × r</code>
                 <p>Peak PP {result.peakRank.rank}：N<sub>flight</sub> = {result.pipelineInflight}，r = {result.recomputeFactor.toFixed(2)}；当前为 {gb(result.activation)}</p>
               </article>
-            </div>
-
-            <div className="activation-formulas">
-              <h4>激活值分层近似</h4>
-              <div>
-                <code>A<sub>full/layer</sub> ≈ Tokens × H × 2 × (4 + 12 / TP)</code>
-                <span>{gb(result.fullLayerActivation / GiB)} / layer</span>
-              </div>
-              <div>
-                <code>A<sub>linear/layer</sub> ≈ Tokens × H × 2 × (3.5 + 9 / TP) + Tokens × V × 2 / TP</code>
-                <span>{gb(result.linearLayerActivation / GiB)} / layer</span>
-              </div>
-              <div>
-                <code>
-                  {shape.experts > 0
-                    ? <>A<sub>moe/layer</sub> ≈ Tokens × TopK × I<sub>moe</sub> × 2 / (ETP × EP)</>
-                    : <>A<sub>mlp/layer</sub> ≈ Tokens × I<sub>FFN</sub> × 2 / TP</>}
-                </code>
-                <span>{gb(result.moeActivation / GiB)} / layer</span>
-              </div>
             </div>
 
             <div className="scenario-heading">
