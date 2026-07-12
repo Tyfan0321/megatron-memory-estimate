@@ -40,6 +40,10 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /不可切分激活/);
   assert.match(html, /RMSNorm/);
   assert.match(html, /Router logits/);
+  assert.match(html, /4 = 2 \+ 1 \+ 1/);
+  assert.match(html, /12 = 4 \+ 8/);
+  assert.match(html, /10 → 8/);
+  assert.match(html, /校准系数/);
   assert.match(html, /All-to-All buffer/);
   assert.doesNotMatch(html, /配置参数如何影响显存公式/);
   assert.doesNotMatch(html, /<h3>优化建议<\/h3>/);

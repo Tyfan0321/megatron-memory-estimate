@@ -611,13 +611,16 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <div className="activation-topic-body">
                   <code>A<sub>full/layer</sub> ≈ Tokens × H × 2 × (4 + 12 / TP)</code>
                   <dl>
-                    <div><dt>可切分激活</dt><dd>Q / K / V 投影、按 head 保存的 attention context、output projection 输入及 head gate；沿 head 或投影维随 TP 下降。</dd></div>
-                    <div><dt>不可切分激活</dt><dd>Residual stream、层输入输出、RMSNorm / LayerNorm 输入输出等 hidden-size Tensor；当前近似中不随 TP 下降，启用 SP 后其中部分可沿序列切分。</dd></div>
+                    <div><dt>推导基线</dt><dd>标准 Transformer 的 Megatron 近似为 <code>sbh × (10 + 24 / TP + 5aS / hTP)</code> Bytes。</dd></div>
+                    <div><dt>化简过程</dt><dd>dropout=0 去掉两个 1-byte mask：10 → 8；Flash Attention / 选择性重计算不保存二次 attention 矩阵项。于是 <code>8 + 24 / TP = 2 × (4 + 12 / TP)</code>。</dd></div>
+                    <div><dt>4 = 2 + 1 + 1</dt><dd>两个 Norm 输入各 1 份 H；QKV 共享输入 1 份 H；第一层 MLP 共享输入 1 份 H。这 4 份不随 TP 切分。</dd></div>
+                    <div><dt>12 = 4 + 8</dt><dd>Attention 内部 4 份：Q、K、V、context；Dense FFN 内部 8 份：第二个线性层输入 4H，加上 GeLU 输入 4H。它们按 TP 切分。</dd></div>
+                    <div><dt>Attention 4</dt><dd>Q + K 共 2H，V 为 1H，output projection 前的 context 为 1H，合计 4H / TP。</dd></div>
+                    <div><dt>FFN 8</dt><dd>标准 4H FFN 保存第二个线性层输入 4H 和 GeLU 反向输入 4H，合计 8H / TP。</dd></div>
                     <div><dt>Tokens</dt><dd>MBS × SeqLen / CP = {Math.round(result.tokens).toLocaleString("en-US")}</dd></div>
                     <div><dt>H × 2</dt><dd>hidden elements × BF16 2 Bytes；当前 H = {shape.hidden.toLocaleString("en-US")}</dd></div>
-                    <div><dt>4</dt><dd>约 4 份不随 TP 完全切分的 hidden-size 激活，如层输入、残差与归一化结果。</dd></div>
-                    <div><dt>12 / TP</dt><dd>约 12 份可沿 TP 切分的注意力投影及反向所需等效激活。</dd></div>
-                    <div><dt>假设</dt><dd>使用 Flash Attention 类内核，不保存完整的 SeqLen × SeqLen 注意力矩阵。</dd></div>
+                    <div><dt>适用边界</dt><dd>4 与 12 来自标准 Dense 4H + GeLU Transformer。Qwen3.5 的 SwiGLU、MoE、Gated Attention 和融合内核会改变实际保存项，因此这里作为校准基线。</dd></div>
+                    <div><dt>参考</dt><dd><a href="https://proceedings.mlsys.org/paper_files/paper/2023/file/80083951326cf5b35e5100260d64ed81-Paper-mlsys2023.pdf" target="_blank" rel="noreferrer">Reducing Activation Recomputation in Large Transformer Models</a></dd></div>
                   </dl>
                 </div>
               </details>
@@ -629,12 +632,12 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
                 <div className="activation-topic-body">
                   <code>A<sub>linear/layer</sub> ≈ Tokens × H × 2 × (3.5 + 9 / TP) + Tokens × V × 2 / TP</code>
                   <dl>
-                    <div><dt>可切分激活</dt><dd>Q / K / V 投影、value-head state、卷积 / DeltaNet state、门控输出和 output projection 输入；按 head 或 value width 随 TP 切分。</dd></div>
-                    <div><dt>不可切分激活</dt><dd>Residual stream、层输入输出、RMSNorm / LayerNorm 与部分标量门控；当前近似中不随 TP 下降，部分可由 SP 切分。</dd></div>
-                    <div><dt>3.5</dt><dd>残差、归一化、门控等不完全随 TP 切分的 hidden-size 等效激活。</dd></div>
-                    <div><dt>9 / TP</dt><dd>可沿 TP 切分的线性注意力投影与反向保存项。</dd></div>
+                    <div><dt>系数性质</dt><dd><code>3.5</code> 与 <code>9</code> 不是 Megatron 论文常数，而是本估算器针对 Linear Attention 相对 Full Attention 的校准系数。</dd></div>
+                    <div><dt>3.5</dt><dd>约 2 份 Norm 输入、1 份共享投影输入，再加 0.5H 的门控 / recurrent-state 基线；这部分当前不除以 TP。</dd></div>
+                    <div><dt>9 / TP</dt><dd>用于覆盖按 head 切分的 Q / K / V / O、卷积状态和门控中间量；移除了 Full Attention 中 softmax 路径的等效保存量。</dd></div>
                     <div><dt>V</dt><dd>value heads × value dim = {shape.linearValueHeads} × {shape.linearValueDim} = {(shape.linearValueHeads * shape.linearValueDim).toLocaleString("en-US")}</dd></div>
-                    <div><dt>特点</dt><dd>不显式保存二次复杂度的注意力矩阵，但需保留线性状态与门控中间量。</dd></div>
+                    <div><dt>额外 V 项</dt><dd><code>Tokens × V × 2 / TP</code> 单独表示 value-head recurrent state，避免把实际 state width 强行近似成 H。</dd></div>
+                    <div><dt>适用边界</dt><dd>不同 Gated DeltaNet / Linear Attention 内核保存的 state 与 gate 不同，3.5 和 9 需要用训练峰值校准。</dd></div>
                   </dl>
                 </div>
               </details>
