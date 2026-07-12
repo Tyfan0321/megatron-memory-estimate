@@ -130,7 +130,6 @@ button { color: inherit; }
 .activation-topic-body dl > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; align-items: start; padding: 7px 0; border-top: 1px solid #e0dfd7; }
 .activation-topic-body dt { color: #555a50; font-weight: 700; }
 .activation-topic-body dd { color: #686d63; text-align: left; font: 9px/1.55 Arial, Helvetica, sans-serif; }
-.activation-topic-body dd code { color: #343831; font: 8px/1.5 var(--font-geist-mono), monospace; }
 .activation-topic sub { font-size: .72em; }
 .parallel-guide-list { border-bottom: 1px solid var(--line); }
 .parallel-method { border-top: 1px solid var(--line); }

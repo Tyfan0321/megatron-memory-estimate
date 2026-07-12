@@ -36,9 +36,10 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /Sequence Parallel/);
   assert.match(html, /激活值分层近似/);
   assert.match(html, /PP Rank 汇总/);
-  assert.match(html, /来源层/);
-  assert.match(html, /layer_types = full_attention/);
-  assert.match(html, /layer_types = linear_attention/);
+  assert.match(html, /可切分激活/);
+  assert.match(html, /不可切分激活/);
+  assert.match(html, /RMSNorm/);
+  assert.match(html, /Router logits/);
   assert.match(html, /All-to-All buffer/);
   assert.doesNotMatch(html, /配置参数如何影响显存公式/);
   assert.doesNotMatch(html, /<h3>优化建议<\/h3>/);
