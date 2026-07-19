@@ -28,6 +28,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# local package and deployment caches
+/.npm-cache/
+
 # env files (can opt-in for committing if needed)
 .env*
 
