@@ -33,6 +33,9 @@ test("server-renders the Megatron memory estimator", async () => {
   assert.match(html, /Peak PP/);
   assert.match(html, /并行策略作用表/);
   assert.match(html, /Expert Tensor Parallel/);
+  assert.match(html, /EDP · MoE/);
+  assert.match(html, /EDP = GPUs \/ \(ETP × EP × PP\)/);
+  assert.match(html, /Attention：/);
   assert.match(html, /Sequence Parallel/);
   assert.match(html, /激活值分层近似/);
   assert.match(html, /PP Rank 汇总/);

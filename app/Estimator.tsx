@@ -106,9 +106,9 @@ const PARALLEL_GUIDE = [
     summary: "跨 Rank 分布专家",
     effect: "把不同 MoE 专家放到不同 Rank，token 经路由后通过 All-to-All 发往目标专家。",
     advantage: "显著降低单卡独占专家权重，并可随专家数量扩展总容量。",
-    tradeoff: "token dispatch 通信重且易受负载不均影响；专家数据并行域缩小为 DP / EP。",
+    tradeoff: "token dispatch 通信重且易受负载不均影响；Parallel Folding 下专家数据并行域由 ETP、EP 与 PP 共同约束。",
     fit: "专家数量多、路由较均衡且集群具备高带宽 All-to-All 的 MoE 模型。",
-    relation: "P_expert ∝ 1 / EP；EDP = DP / EP",
+    relation: "P_expert ∝ 1 / EP；EDP = GPUs / (ETP × EP × PP)",
   },
   {
     id: "ETP",
@@ -118,7 +118,7 @@ const PARALLEL_GUIDE = [
     advantage: "当单个专家仍过大时继续降低专家权重与中间激活。",
     tradeoff: "增加专家内部集合通信，EP × ETP 拓扑和通信组配置更复杂。",
     fit: "专家 FFN 本身较大；通常让 ETP 留在单机高速互联域内。",
-    relation: "P_expert, A_moe ∝ 1 / (EP × ETP)",
+    relation: "P_expert, A_moe ∝ 1 / (EP × ETP)；EDP 也随 ETP 变化",
   },
   {
     id: "SP",
@@ -218,10 +218,15 @@ function calculate(shape: ModelShape, x: Inputs) {
     shape.layers * (activeExpertPerLayer + routerPerLayer + normPerLayer);
 
   const pp = Math.max(Math.floor(x.pp), 1);
-  const topology = x.tp * pp * x.cp;
-  const dp = x.totalGpus / Math.max(topology, 1);
-  const validTopology = Number.isInteger(dp) && dp >= 1 && Number.isInteger(dp / x.ep);
-  const expertDp = Math.max(dp / Math.max(x.ep, 1), 1);
+  const attentionTopology = x.tp * pp * x.cp;
+  const expertTopology = x.etp * x.ep * pp;
+  const dp = x.totalGpus / Math.max(attentionTopology, 1);
+  const expertDp = shape.experts > 0
+    ? x.totalGpus / Math.max(expertTopology, 1)
+    : 0;
+  const validAttentionTopology = Number.isInteger(dp) && dp >= 1;
+  const validExpertTopology = shape.experts === 0 || (Number.isInteger(expertDp) && expertDp >= 1);
+  const validTopology = validAttentionTopology && validExpertTopology;
 
   const tokens = x.microBatch * x.sequenceLength / Math.max(x.cp, 1);
   const hiddenBytes = tokens * shape.hidden * 2;
@@ -281,7 +286,7 @@ function calculate(shape: ModelShape, x: Inputs) {
     const modelWeights = localParams * 2 / GiB;
     const gradients = localParams * 4 / GiB;
     const optimizerDistributed =
-      (localDense * 12 / Math.max(dp, 1) + localExpert * 12 / expertDp) / GiB;
+      (localDense * 12 / Math.max(dp, 1) + localExpert * 12 / Math.max(expertDp, 1)) / GiB;
     const optimizerReplicated = localParams * 12 / GiB;
     const optimizer = x.distributedOptimizer ? optimizerDistributed : optimizerReplicated;
     const modelState = modelWeights + gradients + optimizer;
@@ -569,12 +574,19 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               {(["tp", "pp", "ep", "cp", "etp"] as const).map((key) => (
                 <NumberField key={key} label={key.toUpperCase()} value={inputs[key]} onChange={(v) => update(key, v)} />
               ))}
-              <div className="derived-field"><span>DP</span><strong>{Number.isInteger(result.dp) ? result.dp : result.dp.toFixed(2)}</strong></div>
+            </div>
+            <div className="topology-derived">
+              <div className="derived-field"><span>DP · Attention</span><strong>{Number.isInteger(result.dp) ? result.dp : result.dp.toFixed(2)}</strong></div>
+              <div className="derived-field"><span>EDP · MoE</span><strong>{shape.experts === 0 ? "—" : Number.isInteger(result.expertDp) ? result.expertDp : result.expertDp.toFixed(2)}</strong></div>
             </div>
             <p className={`topology-note ${result.validTopology ? "" : "invalid"}`}>
               {result.validTopology
-                ? `${inputs.tp} TP × ${inputs.pp} PP × ${inputs.cp} CP × ${result.dp} DP = ${inputs.totalGpus} GPUs；EP ${inputs.ep} 在数据并行域内分组。`
-                : "GPU 总数需能被 TP × PP × CP 整除，且 DP 需能被 EP 整除。"}
+                ? shape.experts > 0
+                  ? `Attention：${inputs.tp} TP × ${inputs.pp} PP × ${inputs.cp} CP × ${result.dp} DP = ${inputs.totalGpus} GPUs；MoE：${inputs.etp} ETP × ${inputs.ep} EP × ${result.expertDp} EDP × ${inputs.pp} PP = ${inputs.totalGpus} GPUs。`
+                  : `Attention：${inputs.tp} TP × ${inputs.pp} PP × ${inputs.cp} CP × ${result.dp} DP = ${inputs.totalGpus} GPUs；Dense 模型不使用 EP、ETP 或 EDP。`
+                : shape.experts > 0
+                  ? "Attention 需满足 GPUs ÷ (TP × PP × CP) 为整数；MoE 需满足 GPUs ÷ (ETP × EP × PP) 为整数。"
+                  : "Attention 需满足 GPUs ÷ (TP × PP × CP) 为整数。"}
             </p>
           </div>
 
@@ -749,7 +761,9 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <b>建议</b>
               <span>
                 {!result.validTopology
-                  ? "先让 GPU 数量满足 TP × PP × CP 与 EP 的整除关系。"
+                  ? shape.experts > 0
+                    ? "先让 Attention 与 MoE 两套并行映射都满足整除关系。"
+                    : "先让 GPU 数量满足 TP × PP × CP 的整除关系。"
                   : result.activation > result.modelState * 0.45
                     ? "激活占比较高，优先增加 CP 或使用全量重计算。"
                     : result.headroom < 8
@@ -920,10 +934,17 @@ export function Estimator({ initialConfig }: { initialConfig: JsonObject }) {
               <article>
                 <header><span>03</span><h4>优化器状态</h4><strong>{gb(result.optimizer)}</strong></header>
                 {inputs.distributedOptimizer ? (
-                  <>
-                    <code>M<sub>optim</sub> = (P<sub>dense</sub> × 12 / DP + P<sub>expert</sub> × 12 / EDP) ÷ 2³⁰</code>
-                    <p>EDP = DP / EP = {result.expertDp.toFixed(0)}；当前为 {gb(result.optimizer)}</p>
-                  </>
+                  shape.experts > 0 ? (
+                    <>
+                      <code>M<sub>optim</sub> = (P<sub>dense,local</sub> × 12 / DP + P<sub>expert,local</sub> × 12 / EDP) ÷ 2³⁰</code>
+                      <p>P<sub>expert,local</sub> 已按 EP × ETP 切分；Parallel Folding：EDP = GPUs / (ETP × EP × PP) = {result.expertDp.toFixed(0)}；当前为 {gb(result.optimizer)}</p>
+                    </>
+                  ) : (
+                    <>
+                      <code>M<sub>optim</sub> = P<sub>dense,local</sub> × 12 / DP ÷ 2³⁰</code>
+                      <p>Dense 模型没有专家状态；当前为 {gb(result.optimizer)}</p>
+                    </>
+                  )
                 ) : (
                   <>
                     <code>M<sub>optim</sub> = P<sub>local</sub> × 12 B ÷ 2³⁰</code>

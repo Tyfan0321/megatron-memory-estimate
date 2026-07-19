@@ -87,6 +87,7 @@ button { color: inherit; }
 .select-wrap::after { content: "↓"; position: absolute; right: 10px; top: 13px; font: 11px var(--font-geist-mono), monospace; pointer-events: none; }
 .parallel-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
 .parallel-grid input { padding: 0 7px; text-align: center; }
+.topology-derived { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 8px; }
 .derived-field { display: grid; gap: 7px; }
 .derived-field strong { height: 43px; display: grid; place-items: center; background: #e8e7df; font: 13px var(--font-geist-mono), monospace; }
 .topology-note { margin: 12px 0 0; color: var(--muted); font: 10px/1.55 var(--font-geist-mono), monospace; }

@@ -58,10 +58,12 @@ npm test       # 构建并检查服务端渲染结果
 拓扑关系为：
 
 ```text
-DP = GPU 总数 / (TP × PP × CP)
-专家数据并行度 = DP / EP
+Attention：DP = GPU 总数 / (TP × PP × CP)
+MoE Parallel Folding：EDP = GPU 总数 / (ETP × EP × PP)
 每卡 Tokens = Micro Batch × Sequence Length / CP
 ```
+
+这里的 ETP 是 MoE 层的专家内张量并行；它与 EP、PP 共同决定专家数据并行域 EDP。若没有启用 Parallel Folding，且 ETP 与 TP 绑定，则上式退化为常见的 `EDP = DP / EP`（CP 为 1 时）。
 
 内部按 `1024³ Bytes` 换算容量，界面统一显示为 GB。
 
